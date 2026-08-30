@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "zecor-tokcount"
+description = "Exact BPE token counting and byte-precise context trimming for LLM cost control."
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Hilachem Ventures LLC"]
+repository = "https://github.com/zecordev/zecor-tokcount"
+rust-version = "1.75"
+
+[lib]
+name = "zecor_tokcount"
+path = "src/lib.rs"
+
+[[bin]]
+name = "zecor-tokcount"
+path = "src/main.rs"
+
+[dependencies]
+tiktoken-rs = "0.6"
+tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
