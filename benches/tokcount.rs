@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `cargo bench` -- count / trim / pack / diff-trim on realistic inputs.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 use zecor_tokcount::{diff_trim, pack, Encoder};
 
 fn source_blob(kb: usize) -> String {
