@@ -50,8 +50,10 @@ impl Encoder {
         })
     }
 
-    /// Return `text` truncated so it encodes to at most `max_tokens` tokens. Trimming is
-    /// on a token boundary, then decoded back to a valid string.
+    /// Return `text` truncated so it encodes to at most `max_tokens` tokens, on a token
+    /// boundary, decoded back to a valid string. Byte-level BPE can split a multibyte
+    /// character across tokens, so the cut may back off a few tokens to land on a valid
+    /// UTF-8 boundary (still `<= max_tokens`).
     pub fn trim(&self, text: &str, max_tokens: usize) -> Result<String> {
         match self {
             Encoder::Tik(bpe) => {
@@ -59,8 +61,12 @@ impl Encoder {
                 if ids.len() <= max_tokens {
                     return Ok(text.to_string());
                 }
-                bpe.decode(ids[..max_tokens].to_vec())
-                    .map_err(|e| anyhow!("decode: {e}"))
+                for take in (0..=max_tokens).rev().take(6) {
+                    if let Ok(s) = bpe.decode(ids[..take].to_vec()) {
+                        return Ok(s);
+                    }
+                }
+                Ok(String::new()) // <=6 tokens all straddle a char boundary: give up cleanly
             }
             Encoder::Hf(t) => {
                 let enc = t.encode(text, false).map_err(|e| anyhow!("encode: {e}"))?;
@@ -68,8 +74,12 @@ impl Encoder {
                 if ids.len() <= max_tokens {
                     return Ok(text.to_string());
                 }
-                Ok(t.decode(&ids[..max_tokens], true)
-                    .map_err(|e| anyhow!("decode: {e}"))?)
+                for take in (0..=max_tokens).rev().take(6) {
+                    if let Ok(s) = t.decode(&ids[..take], true) {
+                        return Ok(s);
+                    }
+                }
+                Ok(String::new())
             }
         }
     }
@@ -219,15 +229,21 @@ pub fn diff_trim(enc: &Encoder, diff: &str, budget: usize) -> Result<String> {
     // reserve for it up front so a late drop can't push the result back over budget.
     const MARKER_TOKENS: usize = 48;
     let inner_budget = budget.saturating_sub(MARKER_TOKENS);
+
+    // Count each block once (O(n) encodes), keep while the running sum fits. BPE is not
+    // additive across a join, but the drift is a token or two per boundary -- far under
+    // the marker reserve -- so a single accumulator is accurate enough here.
     let mut kept = String::new();
+    let mut used = 0usize;
     let mut dropped = 0usize;
     for b in &blocks {
         if b.is_empty() {
             continue;
         }
-        // recount the running result: BPE is not additive across a join boundary
-        if !b.starts_with("@@") || enc.count(&format!("{kept}{b}"))? <= inner_budget {
+        let bt = enc.count(b)?;
+        if !b.starts_with("@@") || used + bt <= inner_budget {
             kept.push_str(b);
+            used += bt;
         } else {
             dropped += 1;
         }
@@ -265,6 +281,95 @@ mod tests {
     #[test]
     fn unknown_encoding_errors() {
         assert!(Encoder::load("not-a-real-encoding").is_err());
+    }
+
+    #[test]
+    fn every_builtin_encoding_loads_and_counts() {
+        for spec in [
+            "cl100k_base",
+            "o200k_base",
+            "p50k_base",
+            "r50k_base",
+            "gpt2",
+        ] {
+            let e = Encoder::load(spec).unwrap_or_else(|_| panic!("load {spec}"));
+            assert!(
+                e.count("def add(a, b):\n    return a + b\n").unwrap() > 4,
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn trim_is_a_noop_at_or_under_budget() {
+        let e = Encoder::load("cl100k_base").unwrap();
+        let text = "exactly some words here";
+        let n = e.count(text).unwrap();
+        assert_eq!(e.trim(text, n).unwrap(), text);
+        assert_eq!(e.trim(text, n + 100).unwrap(), text);
+        assert_eq!(e.trim("", 0).unwrap(), "");
+    }
+
+    #[test]
+    fn trim_never_returns_invalid_utf8_on_a_multibyte_boundary() {
+        let e = Encoder::load("cl100k_base").unwrap();
+        // emoji + CJK: token boundaries do not line up with char boundaries
+        let text = "🚀 контейнер 日本語 サンドボックス ".repeat(30);
+        for budget in [1usize, 2, 3, 5, 8, 13, 21] {
+            let out = e.trim(&text, budget).unwrap(); // must not panic
+            assert!(e.count(&out).unwrap() <= budget);
+            assert!(std::str::from_utf8(out.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn pack_with_a_zero_budget_drops_everything() {
+        let e = Encoder::load("cl100k_base").unwrap();
+        let files = vec![("a".into(), "x".into()), ("b".into(), "y".into())];
+        let r = pack(&e, &files, 0).unwrap();
+        assert!(r.text.is_empty() && r.included.is_empty());
+        assert_eq!(r.dropped.len(), 2);
+    }
+
+    #[test]
+    fn pack_keeps_priority_order_of_included_files() {
+        let e = Encoder::load("cl100k_base").unwrap();
+        let files = vec![
+            ("first.txt".into(), "aaa ".repeat(10)),
+            ("second.txt".into(), "bbb ".repeat(10)),
+            ("third.txt".into(), "ccc ".repeat(10)),
+        ];
+        let r = pack(&e, &files, 10_000).unwrap();
+        assert_eq!(r.included, ["first.txt", "second.txt", "third.txt"]);
+        let fp = r.text.find("first.txt").unwrap();
+        let sp = r.text.find("second.txt").unwrap();
+        assert!(fp < sp);
+    }
+
+    #[test]
+    fn diff_trim_headers_only_is_unchanged() {
+        let e = Encoder::load("cl100k_base").unwrap();
+        let d = "diff --git a/x b/x\nindex 111..222 100644\n--- a/x\n+++ b/x\n";
+        assert_eq!(diff_trim(&e, d, 1).unwrap(), d); // nothing droppable
+    }
+
+    #[test]
+    fn cost_local_is_free_and_override_beats_the_table() {
+        let c = cost("local", 5_000_000, 5_000_000, None).unwrap();
+        assert_eq!(c.total_usd, 0.0);
+        let o = cost("gpt-4o", 1_000_000, 0, Some((99.0, 0.0))).unwrap();
+        assert!((o.in_usd - 99.0).abs() < 1e-9); // override, not the 2.50 table price
+    }
+
+    #[test]
+    fn price_lookup_prefers_the_longer_prefix() {
+        assert_eq!(price_per_mtok("gpt-4o-mini"), Some((0.15, 0.60)));
+        assert_eq!(price_per_mtok("gpt-4o"), Some((2.50, 10.00)));
+        assert_eq!(
+            price_per_mtok("claude-3-5-haiku-latest"),
+            Some((0.80, 4.00))
+        );
+        assert_eq!(price_per_mtok("totally-unknown"), None);
     }
 
     #[test]
