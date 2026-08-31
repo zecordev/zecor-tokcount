@@ -62,7 +62,7 @@ impl Encoder {
                     return Ok(text.to_string());
                 }
                 for take in (0..=max_tokens).rev().take(6) {
-                    if let Ok(s) = bpe.decode(ids[..take].to_vec()) {
+                    if let Ok(s) = bpe.decode(&ids[..take]) {
                         return Ok(s);
                     }
                 }
